@@ -1,4 +1,4 @@
-# Encodes any video with first video-stream height >= 1080 to AV1+Opus,
+# Encodes any non-AV1, non-HDR video with first video-stream height >= 1080 to AV1+Opus,
 # writing output next to the input as: "<name>_av1<ext>"
 # Requires ffprobe + ffmpeg in PATH.
 #
@@ -78,7 +78,7 @@ Get-ChildItem -Path . -Recurse -File |
 
       & ffmpeg -hide_banner -y -i "$inFile" `
         -map 0:v:0 -map 0:a:0 `
-        -c:v libsvtav1 -preset 3 -crf 24 -maxrate ${maxrateK}k -bufsize ${bufsizeK}k -g 240 -pix_fmt yuv420p10le `
+        -c:v libsvtav1 -preset 4 -crf 24 -maxrate ${maxrateK}k -bufsize ${bufsizeK}k -g 240 -pix_fmt yuv420p10le `
         -c:a libopus -b:a 128k -movflags +faststart `
         "$outFile"
 
