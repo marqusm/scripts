@@ -26,6 +26,8 @@ done
 target="${1:-.}"
 
 if [ "$no_wake" = 1 ]; then
+    # Without root hdparm fails silently and we'd clean (and wake) anyway.
+    [ "$(id -u)" = 0 ] || { echo "--no-wake needs root" >&2; exit 1; }
     dev=$(findmnt -no SOURCE -T "$target" | sed 's/[0-9]*$//')
     # -C reports spin state without waking the drive; -c would wake it.
     case $(hdparm -C "$dev") in

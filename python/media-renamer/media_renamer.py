@@ -1,10 +1,11 @@
 import argparse
 import json
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 FILENAME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
-_config = json.loads(CONFIG_FILE.read_text())
+_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 IMAGE_EXTENSIONS = set(_config["image_extensions"])
 VIDEO_EXTENSIONS = set(_config["video_extensions"])
 DEVICE_CODES = _config["device_codes"]
@@ -27,6 +28,7 @@ DATE_PATTERNS = [
     (re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}_\d{2}_\d{2})"), "%Y-%m-%d %H_%M_%S"),
 ]
 TRASH_FILES = set(_config["trash_files"])
+EXIF_IFD = 0x8769
 
 
 # Enums
@@ -93,9 +95,13 @@ def collect_actions(folder_path: Path, default_device: str = "", recursive: bool
     files = folder_path.rglob("*") if recursive else folder_path.iterdir()
     actions = []
     skipped = 0
+    claimed: set[str] = set()  # target names already taken by earlier actions in this run
     for file in files:
+        # Skip hidden/system dirs (.git, .Trashes, Synology @eaDir thumbnails).
+        if any(part.startswith((".", "@")) for part in file.relative_to(folder_path).parts[:-1]):
+            continue
         if file.is_file():
-            action = process_file(file, default_device)
+            action = process_file(file, default_device, claimed)
             if action is None:
                 skipped += 1
             else:
@@ -114,32 +120,46 @@ def execute_actions(actions: list[ActionResult], mode: Mode) -> tuple[int, int, 
             failed += 1
     return renamed, deleted, failed
 
-def process_file(file_path: Path, default_device: str = "") -> ActionResult | None:
+def process_file(file_path: Path, default_device: str = "", claimed: set[str] | None = None) -> ActionResult | None:
     media_type = file_type(file_path)
     if media_type == MediaType.IMAGE:
-        return rename_file(file_path, get_image_metadata(file_path, default_device))
+        return rename_file(file_path, get_image_metadata(file_path, default_device), claimed)
     elif media_type == MediaType.VIDEO:
-        return rename_file(file_path, get_video_metadata(file_path, default_device))
+        return rename_file(file_path, get_video_metadata(file_path, default_device), claimed)
     elif media_type == MediaType.TRASH:
         return ActionResult(action=Action.DELETE, path=file_path)
     else:
         logger.info(f"Unsupported file type: {file_path}")
         return None
 
-def rename_file(file_path: Path, metadata: Metadata) -> ActionResult | None:
+def rename_file(file_path: Path, metadata: Metadata, claimed: set[str] | None = None) -> ActionResult | None:
+    """Pick a free target name. `claimed` holds targets already planned in this
+    run (normcase'd full paths) so two files with the same timestamp don't
+    both get the same name; the chosen target is added to it."""
+    if claimed is None:
+        claimed = set()
     base = f"{metadata.date.strftime(FILENAME_FORMAT)}{f'_{metadata.device}' if metadata.device else ''}"
     desired_filename = f"{base}{metadata.extension}"
     if desired_filename == metadata.filename:
         return None
 
+    def taken(name: str) -> bool:
+        target = file_path.parent / name
+        if os.path.normcase(str(target)) in claimed:
+            return True
+        # On case-insensitive filesystems X.JPG "exists" as X.jpg; that is the
+        # file itself (case-only rename), not a collision.
+        return target.exists() and not target.samefile(file_path)
+
     counter = 1
-    while (file_path.parent / desired_filename).exists() and desired_filename != metadata.filename:
+    while taken(desired_filename) and desired_filename != metadata.filename:
         desired_filename = f"{base}_{counter}{metadata.extension}"
         counter += 1
 
     if desired_filename == metadata.filename:
         return None
 
+    claimed.add(os.path.normcase(str(file_path.parent / desired_filename)))
     return ActionResult(action=Action.RENAME, path=file_path, new_filename=desired_filename)
 
 def perform_action(result: ActionResult | None, mode: Mode = Mode.DRAFT) -> bool:
@@ -159,8 +179,12 @@ def perform_action(result: ActionResult | None, mode: Mode = Mode.DRAFT) -> bool
             return True
         logger.info(f"Rename {result.path} -> {result.new_filename}")
         if mode == Mode.EXECUTE:
+            new_file = result.path.parent / result.new_filename
+            # POSIX rename() silently replaces an existing file; never overwrite.
+            if new_file.exists() and not new_file.samefile(result.path):
+                logger.warning(f"Failed to rename {result.path}: target exists: {new_file}")
+                return False
             try:
-                new_file = result.path.parent / result.new_filename
                 result.path.rename(new_file)
             except OSError as e:
                 logger.warning(f"Failed to rename {result.path}: {e}")
@@ -169,6 +193,14 @@ def perform_action(result: ActionResult | None, mode: Mode = Mode.DRAFT) -> bool
 
 
 # Helper functions
+def utc_to_local(dt: datetime) -> datetime:
+    """Video creation_time is UTC (MP4/QuickTime spec) while EXIF dates are
+    local wall-clock time; convert so photos and videos line up. A naive
+    value is taken as UTC too."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().replace(tzinfo=None)
+
 def is_epoch(dt: datetime) -> bool:
     return dt.year == 1970
 
@@ -208,7 +240,7 @@ def parse_arguments():
     parser.add_argument(
         "path",
         type=Path,
-        help="Path to the file or directory to process"
+        help="Directory to process"
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--draft", action="store_true", help="Run in draft mode (no changes)")
@@ -219,6 +251,9 @@ def parse_arguments():
 
 def file_type(file_path: Path) -> MediaType:
     ext = file_path.suffix.lower()
+    # macOS AppleDouble metadata (._IMG_0042.jpg): junk, not a real image.
+    if file_path.name.startswith("._"):
+        return MediaType.TRASH
     if ext in IMAGE_EXTENSIONS:
         return MediaType.IMAGE
     elif ext in VIDEO_EXTENSIONS:
@@ -253,9 +288,12 @@ def get_video_metadata(file_path: Path, default_device: str = "") -> Metadata:
             tags = data['format']['tags']
             if 'creation_time' in tags:
                 try:
-                    metadata.date_taken = datetime.strptime(tags['creation_time'], "%Y-%m-%dT%H:%M:%S.%fZ")
+                    metadata.date_taken = utc_to_local(datetime.fromisoformat(tags['creation_time']))
                 except ValueError:
                     logger.warning(f"Unexpected creation_time format: {tags['creation_time']}")
+            # TODO: recheck the 'software' fallback. Some devices (e.g. Canon A60 -> "CanonMVI01")
+            # only identify themselves there, but it often holds encoder/app strings like
+            # "Lavf58.29.100", which then end up in the filename as an unknown device.
             device_name = tags.get('com.android.model') or tags.get('com.apple.quicktime.model') or tags.get('software')
             if device_name:
                 metadata.device = get_device_code(device_name, default_device)
@@ -273,7 +311,9 @@ def get_image_metadata(file_path: Path, default_device: str = "") -> Metadata:
             try:
                 exif_data = img.getexif()
                 if exif_data:
-                    for tag_id, value in exif_data.items():
+                    # getexif() only exposes IFD0 (Model etc.); cameras store
+                    # DateTimeOriginal in the Exif sub-IFD, so merge that too.
+                    for tag_id, value in (*exif_data.items(), *exif_data.get_ifd(EXIF_IFD).items()):
                         tag = TAGS.get(tag_id, tag_id)
                         exif_dict[tag] = value
             except (AttributeError, ValueError, OSError) as e:

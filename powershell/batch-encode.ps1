@@ -1,9 +1,12 @@
 # Encodes any video with first video-stream height >= 1080 to AV1+Opus,
-# writing output next to the input as: "<name>_av1<ext>"
-# Requires ffprobe + ffmpeg in PATH.
+# writing output next to the input as: "<name>_av1<ext>" (<ext> becomes .mkv
+# unless the input is .mp4/.mkv/.webm). Requires ffprobe + ffmpeg in PATH.
 #
-# Note: -map 0:v:0 -map 0:a:0 keeps only the first video and first audio stream.
+# Note: -map 0:v:0 -map 0:a:0? keeps only the first video and first audio
+# stream (if any).
 # Subtitles, secondary audio tracks, and chapters are NOT carried over.
+# Audio is remapped to a layout libopus accepts: it rejects ffmpeg's
+# "5.1(side)", the usual label for AC3/DTS 5.1 tracks.
 
 $ext = @("mp4","mkv","mov","m4v","webm","avi","ts","m2ts","mts","wmv","flv","3gp")
 
@@ -16,15 +19,25 @@ Get-ChildItem -Path . -Recurse -File |
     # Skip files that already look like outputs.
     if ($_.BaseName -like "*_av1") { return }
 
-    # Probe codec, height, frame rate, and color transfer of first video stream
-    $probe = & ffprobe -v error -select_streams v:0 `
+    # Probe codec, height, frame rate, and color transfer of first video stream.
+    # JSON, not positional lines: ffprobe prints fields in its own internal
+    # order, not the order given in -show_entries.
+    $json = & ffprobe -v error -select_streams v:0 `
       -show_entries stream=codec_name,height,r_frame_rate,color_transfer `
-      -of default=nokey=1:noprint_wrappers=1 "$inFile" 2>$null
+      -of json "$inFile" 2>$null | Out-String
 
-    $codec = $probe | Select-Object -First 1
-    $h = $probe | Select-Object -Skip 1 -First 1
-    $rate = $probe | Select-Object -Skip 2 -First 1
-    $transfer = $probe | Select-Object -Skip 3 -First 1
+    $stream = $null
+    # Bad JSON leaves $stream null; the check below reports it.
+    try { $stream = ($json | ConvertFrom-Json).streams | Select-Object -First 1 } catch { $stream = $null }
+    if (-not $stream) {
+      Write-Warning "SKIP (ffprobe found no video stream): $inFile"
+      return
+    }
+
+    $codec = $stream.codec_name
+    $h = [string]$stream.height
+    $rate = $stream.r_frame_rate
+    $transfer = $stream.color_transfer
 
     if ($codec -eq "av1") {
       Write-Host "SKIP (already AV1): $inFile"
@@ -65,7 +78,10 @@ Get-ChildItem -Path . -Recurse -File |
 
       $bufsizeK = $maxrateK * 2
 
-      $outFile = Join-Path $_.DirectoryName ($_.BaseName + "_av1" + $_.Extension)
+      # AVI/WMV/MOV/etc. can't hold AV1+Opus; fall back to MKV for those.
+      $outExt = $_.Extension
+      if (@(".mp4", ".mkv", ".webm") -notcontains $outExt.ToLower()) { $outExt = ".mkv" }
+      $outFile = Join-Path $_.DirectoryName ($_.BaseName + "_av1" + $outExt)
 
       # Skip if output already exists
       if (Test-Path -LiteralPath $outFile) {
@@ -77,8 +93,9 @@ Get-ChildItem -Path . -Recurse -File |
       Write-Host " -> $outFile"
 
       & ffmpeg -hide_banner -y -i "$inFile" `
-        -map 0:v:0 -map 0:a:0 `
+        -map 0:v:0 -map 0:a:0? `
         -c:v libsvtav1 -preset 3 -crf 24 -maxrate ${maxrateK}k -bufsize ${bufsizeK}k -g 240 -pix_fmt yuv420p10le `
+        -af "aformat=channel_layouts=7.1|5.1|stereo|mono" `
         -c:a libopus -b:a 128k -movflags +faststart `
         "$outFile"
 

@@ -13,6 +13,6 @@
     "moto g75 5G": "MotoG75"
   },
   "image_extensions": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"],
-  "video_extensions": [".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv", ".webm"],
+  "video_extensions": [".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv", ".webm", ".m4v", ".3gp", ".mts", ".m2ts"],
   "trash_files": ["Thumbs.db", ".DS_Store", "desktop.ini"]
 }

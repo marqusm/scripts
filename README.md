@@ -44,8 +44,13 @@ them to the host's crontab with `sudo crontab -e`.
   `MAX_TEMP=<n>`). Logs to syslog (tag `temp-monitor`). Must run as root.
   Intended for Raspberry Pi. _Requires: `vcgencmd`, `logger`._
 - **setup-shell-defaults.sh** — Bootstrap a fresh Debian-like box with a
-  personal `update` alias, arrow-key history search, and the `joe` editor.
+  personal `update` alias (skipped when an `update` command such as
+  `update.sh` is installed), arrow-key history search, and the `joe` editor.
   Idempotent. See header for the `curl | sudo bash` invocation.
+- **clean-temp.sh** — Deletes macOS junk (`.DS_Store`, `._*`, `__MACOSX`)
+  from a directory tree on one filesystem. `--dry-run` lists only;
+  `--no-wake` (root) exits if the disk is spun down. Leaves `.Trashes` and
+  `.TemporaryItems` alone. _`--no-wake` requires: `findmnt`, `hdparm`._
 
 ### powershell/
 - **batch-encode.ps1** — Re-encodes any HD+ video in the current directory
@@ -67,6 +72,9 @@ them to the host's crontab with `sudo crontab -e`.
   ```powershell
   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
   ```
+- **upgrade-apps.bat** — Self-elevates to admin and runs
+  `winget upgrade --all` (accepting agreements, including unknown-version
+  apps). Double-click to run.
 
 ### python/media-renamer/
 - Renames image/video files to `YYYY-MM-DD_HH-MM-SS[_DEVICE].ext` using
@@ -74,12 +82,20 @@ them to the host's crontab with `sudo crontab -e`.
   Run `python media_renamer.py <path> [--execute|--draft]`. See its
   `README.md` for details.
 
+### python/command-executor/
+- Applies a YAML list of rename / move / delete operations, dry-run by
+  default. Moves are two-phase (swaps work), deletes go to a trash folder,
+  and every run writes an undo file. Run
+  `python command_executor.py --commands commands.yaml [--execute]`. See its
+  `README.md` for the format and safety rules.
+
 ## Development
 
 - Bash scripts standardize on `#!/usr/bin/env bash` + `set -euo pipefail`.
 - Lint locally before pushing:
   - `shellcheck bash/*.sh`
   - `Invoke-ScriptAnalyzer -Path powershell -Recurse` (PowerShell)
-- CI (`.github/workflows/lint.yml`) re-runs both on every push / PR.
+  - `pytest` in `python/media-renamer` and `python/command-executor`
+- CI (`.github/workflows/lint.yml`) re-runs all three on every push / PR.
 - `.editorconfig` + `.gitattributes` pin formatting and EOLs (LF, with
-  `*.ps1` kept as CRLF for Windows-native tooling).
+  `*.ps1` / `*.bat` kept as CRLF for Windows-native tooling).

@@ -4,14 +4,15 @@ set -euo pipefail
 # run this directly from web by running following command
 # curl "https://raw.githubusercontent.com/marqusm/scripts/main/bash/setup-shell-defaults.sh" | sudo bash
 
-# Set update alias
+# Set update alias. Only when no `update` command exists, so it doesn't shadow
+# bash/update.sh installed as /usr/local/bin/update (aliases win over PATH).
 if ! grep -q "alias update=" /etc/bash.bashrc; then
     sudo tee -a /etc/bash.bashrc >/dev/null <<'EOF'
 
 # -------
 # Aliases
 # -------
-alias update="sudo apt update && sudo apt -y upgrade && sudo apt -y dist-upgrade && sudo apt -y autoremove"
+command -v update >/dev/null 2>&1 || alias update="sudo apt update && sudo apt -y upgrade && sudo apt -y dist-upgrade && sudo apt -y autoremove"
 EOF
 fi
 

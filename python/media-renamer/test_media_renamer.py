@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -26,7 +26,7 @@ def test_process_file_image_returns_action_result(monkeypatch, tmp_path):
     expected = media_renamer.ActionResult(action=media_renamer.Action.RENAME, path=dummy_path, new_filename="new.jpg")
     monkeypatch.setattr(media_renamer, "file_type", lambda _p: media_renamer.MediaType.IMAGE)
     monkeypatch.setattr(media_renamer, "get_image_metadata", lambda _p, _d="": fake_metadata)
-    monkeypatch.setattr(media_renamer, "rename_file", lambda _p, _m: expected)
+    monkeypatch.setattr(media_renamer, "rename_file", lambda _p, _m, _c=None: expected)
 
     result = media_renamer.process_file(dummy_path)
     assert result == expected
@@ -40,7 +40,7 @@ def test_process_file_video_returns_action_result(monkeypatch, tmp_path):
     expected = media_renamer.ActionResult(action=media_renamer.Action.RENAME, path=dummy_path, new_filename="new.mp4")
     monkeypatch.setattr(media_renamer, "file_type", lambda _p: media_renamer.MediaType.VIDEO)
     monkeypatch.setattr(media_renamer, "get_video_metadata", lambda _p, _d="": fake_metadata)
-    monkeypatch.setattr(media_renamer, "rename_file", lambda _p, _m: expected)
+    monkeypatch.setattr(media_renamer, "rename_file", lambda _p, _m, _c=None: expected)
 
     result = media_renamer.process_file(dummy_path)
     assert result == expected
@@ -244,7 +244,69 @@ def test_rename_file_handles_multiple_collisions(tmp_path):
     assert result.new_filename == "2023-04-15_09-30-12_S24_2.jpg"
 
 
+def test_rename_file_avoids_names_claimed_in_same_run(tmp_path):
+    a = tmp_path / "a.jpg"
+    b = tmp_path / "b.jpg"
+    a.write_text("x")
+    b.write_text("x")
+    claimed = set()
+    meta = lambda name: media_renamer.Metadata(
+        filename=name, extension=".jpg", date=datetime(2023, 4, 15, 9, 30, 12), device="S24")
+    ra = media_renamer.rename_file(a, meta("a.jpg"), claimed)
+    rb = media_renamer.rename_file(b, meta("b.jpg"), claimed)
+    assert ra.new_filename == "2023-04-15_09-30-12_S24.jpg"
+    assert rb.new_filename == "2023-04-15_09-30-12_S24_1.jpg"
+
+
+def test_collect_and_execute_same_timestamp_keeps_both_files(tmp_path, monkeypatch):
+    for name in ("a.jpg", "b.jpg"):
+        (tmp_path / name).write_text(name)
+    monkeypatch.setattr(media_renamer, "get_image_metadata", lambda p, _d="": media_renamer.Metadata(
+        filename=p.name, extension=".jpg", date=datetime(2023, 4, 15, 9, 30, 12), device="S24"))
+
+    actions, _ = media_renamer.collect_actions(tmp_path)
+    renamed, _, failed = media_renamer.execute_actions(actions, media_renamer.Mode.EXECUTE)
+    assert (renamed, failed) == (2, 0)
+    assert sorted(p.read_text() for p in tmp_path.iterdir()) == ["a.jpg", "b.jpg"]
+
+
+def test_rename_file_case_only_extension_is_not_a_collision(tmp_path):
+    f = tmp_path / "2023-04-15_09-30-12_S24.JPG"
+    f.write_text("x")
+    meta = media_renamer.Metadata(
+        filename=f.name, extension=".jpg", date=datetime(2023, 4, 15, 9, 30, 12), device="S24")
+    result = media_renamer.rename_file(f, meta)
+    assert result.new_filename == "2023-04-15_09-30-12_S24.jpg"
+    assert media_renamer.perform_action(result, media_renamer.Mode.EXECUTE) is True
+    assert [p.name for p in tmp_path.iterdir()] == ["2023-04-15_09-30-12_S24.jpg"]
+
+
+def test_file_type_appledouble_is_trash():
+    assert media_renamer.file_type(Path("._IMG_0042.jpg")) == media_renamer.MediaType.TRASH
+
+
+def test_collect_actions_recursive_skips_hidden_and_system_dirs(tmp_path, monkeypatch):
+    for d in (".git", "@eaDir", "sub"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "a.jpg").write_text("x")
+    monkeypatch.setattr(media_renamer, "get_image_metadata", lambda p, _d="": media_renamer.Metadata(
+        filename=p.name, extension=".jpg", date=datetime(2023, 4, 15, 9, 30, 12)))
+
+    actions, _ = media_renamer.collect_actions(tmp_path, recursive=True)
+    assert [a.path.parent.name for a in actions] == ["sub"]
+
+
 # --- perform_action tests ---
+
+def test_perform_action_execute_refuses_to_overwrite(tmp_path):
+    src = tmp_path / "old.jpg"
+    src.write_text("src")
+    (tmp_path / "new.jpg").write_text("existing")
+    result = media_renamer.ActionResult(action=media_renamer.Action.RENAME, path=src, new_filename="new.jpg")
+    assert media_renamer.perform_action(result, media_renamer.Mode.EXECUTE) is False
+    assert src.exists()
+    assert (tmp_path / "new.jpg").read_text() == "existing"
+
 
 def test_perform_action_draft_prints_rename(caplog):
     result = media_renamer.ActionResult(action=media_renamer.Action.RENAME, path=Path("/tmp/old.jpg"), new_filename="new.jpg")
@@ -363,8 +425,9 @@ def test_get_image_metadata_reads_exif(tmp_path):
     file_path = tmp_path / "photo.jpg"
     img = Image.new('RGB', (1, 1), color='red')
     exif = img.getexif()
-    exif[0x0110] = "Canon PowerShot A60"      # Model
-    exif[0x9003] = "2004:07:17 10:15:30"      # DateTimeOriginal
+    exif[0x0110] = "Canon PowerShot A60"      # Model (IFD0)
+    # DateTimeOriginal lives in the Exif sub-IFD, as real cameras write it.
+    exif.get_ifd(media_renamer.EXIF_IFD)[0x9003] = "2004:07:17 10:15:30"
     img.save(str(file_path), exif=exif.tobytes())
 
     metadata = media_renamer.get_image_metadata(file_path)
@@ -409,9 +472,17 @@ def test_get_video_metadata_with_ffprobe_data(tmp_path, monkeypatch):
     monkeypatch.setattr(media_renamer.subprocess, "run", lambda *_, **__: mock_result)
 
     metadata = media_renamer.get_video_metadata(file_path)
-    assert metadata.date_taken == datetime(2023, 6, 1, 14, 30, 0)
+    expected = datetime(2023, 6, 1, 14, 30, 0, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    assert metadata.date_taken == expected
     assert metadata.device == "A60"
-    assert metadata.date == datetime(2023, 6, 1, 14, 30, 0)
+    assert metadata.date == expected
+
+
+def test_utc_to_local_converts_and_accepts_no_fraction():
+    aware = datetime(2023, 6, 1, 14, 30, tzinfo=timezone.utc)
+    local = aware.astimezone().replace(tzinfo=None)
+    assert media_renamer.utc_to_local(datetime.fromisoformat("2023-06-01T14:30:00Z")) == local
+    assert media_renamer.utc_to_local(datetime(2023, 6, 1, 14, 30)) == local
 
 
 def test_get_video_metadata_ffprobe_missing(tmp_path, monkeypatch):

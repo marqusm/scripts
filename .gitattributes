@@ -6,6 +6,10 @@
 *.psm1 text eol=crlf
 *.psd1 text eol=crlf
 
+# cmd.exe can misparse labels / `::` comments in LF batch files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
 # Explicit binary so git never line-end-converts these.
 *.png binary
 *.jpg binary
